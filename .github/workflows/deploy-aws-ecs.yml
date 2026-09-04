@@ -1,0 +1,119 @@
+name: AWS ECS DevSecOps Deployment
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      apply_infrastructure:
+        description: "Apply Terraform infrastructure changes"
+        type: boolean
+        default: false
+      deploy_application:
+        description: "Deploy the container to ECS"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_VPC_ID: ${{ vars.AWS_VPC_ID }}
+  AWS_SUBNET_IDS: ${{ vars.AWS_SUBNET_IDS }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: hashicorp/setup-terraform@v3
+      - name: Install and test
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          ruff check .
+          pytest
+      - name: Audit dependencies
+        run: |
+          pip install pip-audit
+          pip-audit
+      - name: Scan source tree
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+      - name: Validate Terraform
+        run: |
+          terraform -chdir=infra fmt -check
+          terraform -chdir=infra init -backend=false
+          terraform -chdir=infra validate
+      - name: Scan Terraform
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra
+          framework: terraform
+          soft_fail: false
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_application
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Validate deployment inputs
+        run: |
+          set -euo pipefail
+          test -n "$AWS_REGION"
+          test -n "$AWS_VPC_ID"
+          test -n "$AWS_SUBNET_IDS"
+          test -n "$ECR_REPOSITORY"
+          test -n "$ECS_CLUSTER"
+          test -n "$ECS_SERVICE"
+      - name: Provision infrastructure
+        if: inputs.apply_infrastructure
+        run: |
+          terraform -chdir=infra init -input=false
+          terraform -chdir=infra apply -auto-approve -input=false \
+            -var="aws_region=$AWS_REGION" \
+            -var="vpc_id=$AWS_VPC_ID" \
+            -var='subnet_ids=["${AWS_SUBNET_IDS//,/","}"]'
+      - name: Build, scan, and push image
+        run: |
+          ECR_REGISTRY="${ECR_REPOSITORY%%/*}"
+          IMAGE_URI="$ECR_REPOSITORY:${GITHUB_SHA}"
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          docker build -t "$IMAGE_URI" .
+          trivy image --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 "$IMAGE_URI"
+          docker push "$IMAGE_URI"
+      - name: Deploy ECS task definition
+        run: |
+          terraform -chdir=infra init -input=false
+          terraform -chdir=infra apply -auto-approve -input=false \
+            -var="aws_region=$AWS_REGION" \
+            -var="vpc_id=$AWS_VPC_ID" \
+            -var='subnet_ids=["${AWS_SUBNET_IDS//,/","}"]' \
+            -var="image_uri=$ECR_REPOSITORY:${GITHUB_SHA}"
+      - name: Verify ECS rollout
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --region "$AWS_REGION"
